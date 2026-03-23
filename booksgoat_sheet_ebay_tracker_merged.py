@@ -37,6 +37,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
+os.environ["EBAY_APP_ID"] = "JubranIn-ProfitSc-PRD-4bf497123-06cdelb7"
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:148.0) "
     "Gecko/20100101 Firefox/148.0"
