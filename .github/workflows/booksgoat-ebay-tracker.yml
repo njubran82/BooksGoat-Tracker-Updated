@@ -1,0 +1,40 @@
+name: BooksGoat eBay Tracker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 14 * * *"  # Runs daily at 10 AM ET
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests pandas openpyxl
+
+      - name: Run tracker
+        env:
+          EBAY_APP_ID: ${{ secrets.EBAY_APP_ID }}
+          GOOGLE_SHEET_CSV_URL: ${{ secrets.GOOGLE_SHEET_CSV_URL }}
+          EMAIL_ADDRESS: ${{ secrets.EMAIL_ADDRESS }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          python booksgoat_sheet_ebay_tracker_merged.py --input booksgoat_supplier_backup.csv
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: scan-results
+          path: |
+            *.csv
+            *.xlsx
