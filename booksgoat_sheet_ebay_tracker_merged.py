@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
 """
-BooksGoat sheet + eBay tracker (Google Sheet primary + CSV fallback + email alerts)
-
-What it does
-- Reads supplier data from a Google Sheets CSV export URL
-- Falls back to a local CSV file if the Google Sheet is unavailable
-- Refreshes the local CSV backup automatically whenever the Google Sheet loads successfully
+BooksGoat tracker v2
+- Google Sheet primary + CSV fallback
 - Supports BOTH:
-    1) structured supplier format:
+    1) structured supplier sheet format:
        Title, ISBN-13, ISBN-10, 5 Qty, 10 Qty, 25 Qty, List Price, Amazon Price, Amazon Rank
     2) simple backup format:
-       Enabled, ISBN, Label
-- Queries eBay Finding API for sold and active comps using ISBN first, then title fallback
-- Applies smart 5 Qty / 10 Qty / 25 Qty tier selection
-- Calculates estimated sale price, fees, total cost, profit, and ROI
-- Saves current scan results to CSV/XLSX
-- Compares against the previous run and emails alerts when items materially change
+       Enabled, ISBN, Label, Price, URL
+- Tries to use BooksGoat product URL for cleaner title + live supplier price
+- Uses stronger eBay query fallbacks to reduce "No comps"
+- Saves CSV/XLSX results
+- Tracks state/history and can send alerts
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import os
 import re
@@ -36,11 +32,13 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from urllib.parse import unquote
 
 import pandas as pd
 import requests
 
 # Temporary hardcoded App ID for testing in GitHub
+# Move this to GitHub Secrets later.
 os.environ["EBAY_APP_ID"] = "JubranIn-ProfitSc-PRD-4bf497123-06cdelb7"
 
 USER_AGENT = (
@@ -69,7 +67,7 @@ DEFAULT_PAYMENT_FEE_RATE = 0.00
 DEFAULT_SHIPPING_COST = 4.50
 DEFAULT_PACKAGING_COST = 0.50
 DEFAULT_BUFFER_COST = 0.50
-DEFAULT_PAUSE_SECONDS = 0.15
+DEFAULT_PAUSE_SECONDS = 0.20
 DEFAULT_ALERT_TOP_N = 15
 DEFAULT_MIN_PROFIT_ALERT = 4.0
 DEFAULT_MIN_ROI_ALERT = 0.15
@@ -80,6 +78,14 @@ EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
 TO_EMAIL = os.getenv("TO_EMAIL", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+
+
+STOPWORDS = {
+    "the", "and", "for", "with", "from", "edition", "revised", "updated",
+    "hardcover", "paperback", "spiralbound", "spiral", "softcover",
+    "by", "a", "an", "of", "to", "in", "on", "student", "guide",
+    "manual", "textbook", "book", "volume", "vol", "set"
+}
 
 
 @dataclass
@@ -93,6 +99,20 @@ class SupplierBook:
     list_price: Optional[float]
     amazon_price: Optional[float]
     amazon_rank: Optional[int]
+    source_price: Optional[float]
+    product_url: str
+    enabled: bool
+    source_label: str
+
+
+@dataclass
+class ProductPageInfo:
+    fetched: bool
+    page_title: str
+    extracted_title: str
+    extracted_price: Optional[float]
+    in_stock: Optional[bool]
+    notes: str
 
 
 @dataclass
@@ -128,9 +148,15 @@ class ScanResult:
     title: str
     isbn13: str
     isbn10: str
+    product_url: str
+    supplier_page_fetched: bool
+    supplier_page_title: str
+    supplier_live_price: Optional[float]
+    source_price: Optional[float]
     amazon_price: Optional[float]
     amazon_rank: Optional[int]
     list_price: Optional[float]
+    stock_status: str
     ebay_query_used: str
     ebay_sold_count: int
     ebay_active_count: int
@@ -218,20 +244,46 @@ def refresh_backup_csv(csv_text: str, backup_path: Path = BACKUP_INPUT_FILE) -> 
     temp_path.replace(backup_path)
 
 
-def dataframe_to_supplier_books(df: pd.DataFrame) -> List[SupplierBook]:
+def safe_get(d: Any, *path: Any, default: Any = None) -> Any:
+    cur = d
+    for key in path:
+        if isinstance(cur, list):
+            if not cur:
+                return default
+            try:
+                cur = cur[key]
+            except Exception:
+                return default
+        elif isinstance(cur, dict):
+            cur = cur.get(key, default)
+        else:
+            return default
+    return cur
+
+
+def normalize_supplier_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     original_columns = list(df.columns)
     normalized_input = {str(col).strip().lower(): col for col in original_columns}
 
-    # Support your simple CSV format: Enabled, ISBN, Label
+    # Support simple format: Enabled, ISBN, Label, Price, URL
     if "label" in normalized_input and "isbn" in normalized_input:
-        rename_map = {
+        rename_map: Dict[str, str] = {
             normalized_input["label"]: "Title",
             normalized_input["isbn"]: "ISBN-13",
         }
         if "enabled" in normalized_input:
             rename_map[normalized_input["enabled"]] = "Enabled"
+        if "price" in normalized_input:
+            rename_map[normalized_input["price"]] = "Source Price"
+        if "url" in normalized_input:
+            rename_map[normalized_input["url"]] = "URL"
         df = df.rename(columns=rename_map)
 
+    return df
+
+
+def dataframe_to_supplier_books(df: pd.DataFrame) -> List[SupplierBook]:
+    df = normalize_supplier_dataframe(df)
     normalized = {str(col).strip().lower(): col for col in df.columns}
 
     def has_col(name: str) -> bool:
@@ -247,11 +299,12 @@ def dataframe_to_supplier_books(df: pd.DataFrame) -> List[SupplierBook]:
     seen: set[str] = set()
 
     for _, row in df.iterrows():
-        # If Enabled column exists, honor it
+        enabled = True
         if has_col("Enabled"):
             enabled_val = clean_text(row.get(get_col("Enabled"), "")).lower()
-            if enabled_val and enabled_val not in {"y", "yes", "true", "1"}:
-                continue
+            enabled = enabled_val in {"", "y", "yes", "true", "1"}
+        if not enabled:
+            continue
 
         title = clean_text(row.get(get_col("Title"), ""))
         if not title:
@@ -265,17 +318,29 @@ def dataframe_to_supplier_books(df: pd.DataFrame) -> List[SupplierBook]:
             continue
         seen.add(dedupe_key)
 
+        source_price = parse_float(row.get(get_col("Source Price"))) if has_col("Source Price") else None
+        list_price = parse_float(row.get(get_col("List Price"))) if has_col("List Price") else None
+
+        # If only simple CSV format exists, also use Source Price as a fallback tier price
+        price_5 = parse_float(row.get(get_col("5 Qty"))) if has_col("5 Qty") else source_price
+        price_10 = parse_float(row.get(get_col("10 Qty"))) if has_col("10 Qty") else source_price
+        price_25 = parse_float(row.get(get_col("25 Qty"))) if has_col("25 Qty") else source_price
+
         books.append(
             SupplierBook(
                 title=title,
                 isbn13=isbn13,
                 isbn10=isbn10,
-                price_5=parse_float(row.get(get_col("5 Qty"))) if has_col("5 Qty") else None,
-                price_10=parse_float(row.get(get_col("10 Qty"))) if has_col("10 Qty") else None,
-                price_25=parse_float(row.get(get_col("25 Qty"))) if has_col("25 Qty") else None,
-                list_price=parse_float(row.get(get_col("List Price"))) if has_col("List Price") else None,
+                price_5=price_5,
+                price_10=price_10,
+                price_25=price_25,
+                list_price=list_price,
                 amazon_price=parse_float(row.get(get_col("Amazon Price"))) if has_col("Amazon Price") else None,
                 amazon_rank=parse_int(row.get(get_col("Amazon Rank"))) if has_col("Amazon Rank") else None,
+                source_price=source_price,
+                product_url=clean_text(row.get(get_col("URL"), "")) if has_col("URL") else "",
+                enabled=enabled,
+                source_label=title,
             )
         )
 
@@ -326,6 +391,168 @@ def load_books(args: argparse.Namespace) -> Tuple[List[SupplierBook], str]:
     raise RuntimeError("Could not load input from Google Sheet or CSV fallback.")
 
 
+def extract_booksgoat_title_from_html(html_text: str, fallback_title: str = "") -> str:
+    patterns = [
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<title>(.*?)</title>',
+        r'<h1[^>]*>(.*?)</h1>',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            title = html.unescape(re.sub(r"<[^>]+>", " ", match.group(1)))
+            title = clean_text(title)
+            if title:
+                return title
+    return fallback_title
+
+
+def extract_price_from_html(html_text: str) -> Optional[float]:
+    patterns = [
+        r'["\']price["\']\s*:\s*["\']?([0-9]+(?:\.[0-9]{1,2})?)',
+        r'content=["\']([0-9]+(?:\.[0-9]{1,2})?)["\'][^>]*itemprop=["\']price["\']',
+        r'itemprop=["\']price["\'][^>]*content=["\']([0-9]+(?:\.[0-9]{1,2})?)["\']',
+        r'[$]([0-9]+(?:\.[0-9]{1,2})?)',
+    ]
+    candidates: List[float] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, html_text, re.IGNORECASE):
+            value = parse_float(match.group(1))
+            if value is not None and 1 <= value <= 5000:
+                candidates.append(value)
+    if not candidates:
+        return None
+    # Prefer the smallest reasonable supplier-side price if multiple are present
+    return round(sorted(candidates)[0], 2)
+
+
+def extract_stock_from_html(html_text: str) -> Optional[bool]:
+    text = html_text.lower()
+    if "out of stock" in text:
+        return False
+    if "in stock" in text or "availability" in text:
+        return True
+    return None
+
+
+def fetch_product_page_info(book: SupplierBook) -> ProductPageInfo:
+    if not book.product_url:
+        return ProductPageInfo(
+            fetched=False,
+            page_title="",
+            extracted_title="",
+            extracted_price=None,
+            in_stock=None,
+            notes="No product URL provided.",
+        )
+
+    try:
+        resp = requests.get(book.product_url, headers={"User-Agent": USER_AGENT}, timeout=REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        html_text = resp.text
+
+        page_title = extract_booksgoat_title_from_html(html_text, book.title)
+        extracted_price = extract_price_from_html(html_text)
+        in_stock = extract_stock_from_html(html_text)
+
+        return ProductPageInfo(
+            fetched=True,
+            page_title=page_title,
+            extracted_title=page_title,
+            extracted_price=extracted_price,
+            in_stock=in_stock,
+            notes="Fetched supplier product page successfully.",
+        )
+    except Exception as exc:
+        return ProductPageInfo(
+            fetched=False,
+            page_title="",
+            extracted_title="",
+            extracted_price=None,
+            in_stock=None,
+            notes=f"Supplier page fetch failed: {exc}",
+        )
+
+
+def clean_book_title_for_query(title: str) -> str:
+    text = html.unescape(unquote(title))
+    text = re.sub(r"\(isbn[^)]*\)", " ", text, flags=re.IGNORECASE)
+    text = re.sub(r"\{[^}]*\}", " ", text)
+    text = re.sub(r"\[[^\]]*\]", " ", text)
+    text = re.sub(r"[*_~|]+", " ", text)
+    text = re.sub(r"[^A-Za-z0-9 ]+", " ", text)
+    text = clean_text(text)
+
+    tokens = []
+    for tok in text.split():
+        low = tok.lower()
+        if low in STOPWORDS:
+            continue
+        if len(tok) == 1:
+            continue
+        tokens.append(tok)
+
+    return clean_text(" ".join(tokens))
+
+
+def build_title_variants(title: str) -> List[str]:
+    cleaned = clean_book_title_for_query(title)
+    tokens = cleaned.split()
+
+    variants: List[str] = []
+    if cleaned:
+        variants.append(cleaned)
+        variants.append(f'"{cleaned}"')
+
+    if len(tokens) >= 8:
+        variants.append(" ".join(tokens[:8]))
+    if len(tokens) >= 6:
+        variants.append(" ".join(tokens[:6]))
+    if len(tokens) >= 4:
+        variants.append(" ".join(tokens[:4]))
+
+    # Remove duplicates while preserving order
+    out: List[str] = []
+    seen: set[str] = set()
+    for v in variants:
+        key = v.lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(v)
+    return out
+
+
+def build_queries(book: SupplierBook, page_info: ProductPageInfo) -> List[str]:
+    queries: List[str] = []
+
+    if book.isbn13:
+        queries.append(book.isbn13)
+    if book.isbn10:
+        queries.append(book.isbn10)
+
+    primary_title = page_info.extracted_title or book.title
+    title_variants = build_title_variants(primary_title)
+
+    for q in title_variants:
+        queries.append(q)
+
+    # Backup from raw source label
+    if book.source_label and book.source_label != primary_title:
+        for q in build_title_variants(book.source_label):
+            queries.append(q)
+
+    out: List[str] = []
+    seen: set[str] = set()
+    for q in queries:
+        key = q.lower().strip()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(q)
+
+    return out
+
+
 def ebay_headers(app_id: str) -> Dict[str, str]:
     return {
         "X-EBAY-SOA-OPERATION-NAME": "findItemsAdvanced",
@@ -337,29 +564,12 @@ def ebay_headers(app_id: str) -> Dict[str, str]:
     }
 
 
-def safe_get(d: Any, *path: Any, default: Any = None) -> Any:
-    cur = d
-    for key in path:
-        if isinstance(cur, list):
-            if not cur:
-                return default
-            try:
-                cur = cur[key]
-            except Exception:
-                return default
-        elif isinstance(cur, dict):
-            cur = cur.get(key, default)
-        else:
-            return default
-    return cur
-
-
 def extract_prices_from_finding_items(items: Iterable[Dict[str, Any]]) -> List[float]:
     prices: List[float] = []
     for item in items:
         price_text = safe_get(item, "sellingStatus", 0, "currentPrice", 0, "__value__")
         price = parse_float(price_text)
-        if price is not None:
+        if price is not None and 1 <= price <= 5000:
             prices.append(price)
     return prices
 
@@ -370,10 +580,17 @@ def call_ebay_finding_api(app_id: str, keywords: str, sold_only: bool, entries_p
         ("paginationInput.entriesPerPage", str(entries_per_page)),
         ("sortOrder", "BestMatch" if not sold_only else "EndTimeSoonest"),
         ("outputSelector(0)", "SellerInfo"),
+        ("itemFilter(1).name", "LocatedIn"),
+        ("itemFilter(1).value", "US"),
     ]
     if sold_only:
         params.extend([
             ("itemFilter(0).name", "SoldItemsOnly"),
+            ("itemFilter(0).value", "true"),
+        ])
+    else:
+        params.extend([
+            ("itemFilter(0).name", "HideDuplicateItems"),
             ("itemFilter(0).value", "true"),
         ])
 
@@ -404,31 +621,11 @@ def summarize_prices(prices: List[float]) -> Tuple[Optional[float], Optional[flo
     return statistics.median(prices), statistics.mean(prices), max(prices), min(prices)
 
 
-def build_queries(book: SupplierBook) -> List[str]:
-    queries: List[str] = []
-    if book.isbn13:
-        queries.append(book.isbn13)
-    if book.isbn10:
-        queries.append(book.isbn10)
-    title_no_punct = re.sub(r"[^A-Za-z0-9 ]+", " ", book.title)
-    title_trimmed = " ".join(title_no_punct.split()[:10]).strip()
-    if title_trimmed:
-        queries.append(title_trimmed)
-
-    out: List[str] = []
-    seen = set()
-    for q in queries:
-        key = q.lower()
-        if key not in seen:
-            seen.add(key)
-            out.append(q)
-    return out
-
-
-def get_ebay_summary(app_id: str, book: SupplierBook, pause_seconds: float = DEFAULT_PAUSE_SECONDS) -> EbaySummary:
+def get_ebay_summary(app_id: str, book: SupplierBook, page_info: ProductPageInfo, pause_seconds: float = DEFAULT_PAUSE_SECONDS) -> EbaySummary:
     notes: List[str] = []
-    queries = build_queries(book)
-    for query in queries:
+    queries = build_queries(book, page_info)
+
+    for idx, query in enumerate(queries, start=1):
         try:
             sold_prices, sold_count = call_ebay_finding_api(app_id, query, sold_only=True)
             time.sleep(pause_seconds)
@@ -437,9 +634,9 @@ def get_ebay_summary(app_id: str, book: SupplierBook, pause_seconds: float = DEF
             sold_median, sold_mean, sold_max, _ = summarize_prices(sold_prices)
             active_median, _, _, active_min = summarize_prices(active_prices)
 
+            notes.append(f"Query {idx}/{len(queries)}: {query} -> sold {sold_count}, active {active_count}")
+
             if sold_count > 0 or active_count > 0:
-                if query != (book.isbn13 or book.isbn10):
-                    notes.append(f"Used fallback query: {query}")
                 return EbaySummary(
                     query_used=query,
                     sold_count=sold_count,
@@ -457,7 +654,7 @@ def get_ebay_summary(app_id: str, book: SupplierBook, pause_seconds: float = DEF
             notes.append(f"Query '{query}' failed: {exc}")
 
     return EbaySummary(
-        query_used=queries[0] if queries else book.title,
+        query_used=queries[0] if queries else (book.isbn13 or book.title),
         sold_count=0,
         active_count=0,
         sold_prices=[],
@@ -471,17 +668,50 @@ def get_ebay_summary(app_id: str, book: SupplierBook, pause_seconds: float = DEF
     )
 
 
-def choose_estimated_sale_price(summary: EbaySummary, amazon_price: Optional[float]) -> Optional[float]:
+def choose_supplier_cost(book: SupplierBook, page_info: ProductPageInfo) -> Tuple[Optional[float], str]:
+    # Prefer live product page price
+    if page_info.extracted_price is not None:
+        return page_info.extracted_price, "supplier_live_price"
+    if book.source_price is not None:
+        return book.source_price, "source_price"
+    if book.price_5 is not None:
+        return book.price_5, "price_5"
+    if book.price_10 is not None:
+        return book.price_10, "price_10"
+    if book.price_25 is not None:
+        return book.price_25, "price_25"
+    return None, "none"
+
+
+def choose_estimated_sale_price(summary: EbaySummary, book: SupplierBook, supplier_cost: Optional[float]) -> Optional[float]:
     candidates: List[float] = []
+
     if summary.sold_median is not None:
         candidates.append(summary.sold_median)
+    if summary.sold_mean is not None:
+        candidates.append(summary.sold_mean)
     if summary.active_min is not None and summary.active_min >= DEFAULT_MIN_SOLD_PRICE:
         candidates.append(summary.active_min * 0.97)
-    if amazon_price is not None and amazon_price >= DEFAULT_MIN_SOLD_PRICE:
-        candidates.append(amazon_price * 0.92)
-    if not candidates:
+    if summary.active_median is not None and summary.active_median >= DEFAULT_MIN_SOLD_PRICE:
+        candidates.append(summary.active_median * 0.95)
+    if book.amazon_price is not None and book.amazon_price >= DEFAULT_MIN_SOLD_PRICE:
+        candidates.append(book.amazon_price * 0.92)
+    if book.list_price is not None and book.list_price >= DEFAULT_MIN_SOLD_PRICE:
+        candidates.append(book.list_price * 0.55)
+
+    filtered = [round(x, 2) for x in candidates if x is not None and x >= DEFAULT_MIN_SOLD_PRICE]
+    if not filtered:
         return None
-    return round(sorted(candidates)[0], 2)
+
+    # Conservative estimate: use lower-middle of reasonable options
+    filtered = sorted(filtered)
+
+    if supplier_cost is not None:
+        viable = [x for x in filtered if x > supplier_cost * 1.15]
+        if viable:
+            filtered = viable
+
+    return round(filtered[max(0, len(filtered) // 3)], 2)
 
 
 def evaluate_tier(
@@ -511,7 +741,7 @@ def evaluate_tier(
     elif tier_name == "10 Qty":
         qualifies = sold_count >= 4 and profit >= 6 and (roi or -999) >= 0.20
     elif tier_name == "5 Qty":
-        qualifies = sold_count >= 2 and profit >= 4 and (roi or -999) >= 0.15
+        qualifies = sold_count >= 1 and profit >= 4 and (roi or -999) >= 0.15
 
     return TierEvaluation(
         tier_name=tier_name,
@@ -545,9 +775,9 @@ def quick_decision(profit: Optional[float], roi: Optional[float], sold_count: in
         return "No comps"
     if sold_count >= 8 and profit >= 10 and roi >= 0.30:
         return "Strong buy"
-    if sold_count >= 4 and profit >= 6 and roi >= 0.20:
+    if sold_count >= 3 and profit >= 6 and roi >= 0.20:
         return "Buy"
-    if profit >= 3 and roi >= 0.10:
+    if sold_count >= 1 and profit >= 3 and roi >= 0.10:
         return "Borderline"
     return "Pass"
 
@@ -562,27 +792,53 @@ def scan_book(
     buffer_cost: float,
     pause_seconds: float,
 ) -> ScanResult:
-    summary = get_ebay_summary(app_id, book, pause_seconds=pause_seconds)
-    sale_price = choose_estimated_sale_price(summary, book.amazon_price)
+    page_info = fetch_product_page_info(book)
+    summary = get_ebay_summary(app_id, book, page_info, pause_seconds=pause_seconds)
 
-    tier_5 = evaluate_tier("5 Qty", book.price_5, sale_price, summary.sold_count, ebay_fee_rate, payment_fee_rate, shipping_cost, packaging_cost, buffer_cost)
-    tier_10 = evaluate_tier("10 Qty", book.price_10, sale_price, summary.sold_count, ebay_fee_rate, payment_fee_rate, shipping_cost, packaging_cost, buffer_cost)
-    tier_25 = evaluate_tier("25 Qty", book.price_25, sale_price, summary.sold_count, ebay_fee_rate, payment_fee_rate, shipping_cost, packaging_cost, buffer_cost)
+    supplier_cost, supplier_cost_source = choose_supplier_cost(book, page_info)
+    sale_price = choose_estimated_sale_price(summary, book, supplier_cost)
+
+    tier_5_cost = book.price_5 if book.price_5 is not None else supplier_cost
+    tier_10_cost = book.price_10 if book.price_10 is not None else supplier_cost
+    tier_25_cost = book.price_25 if book.price_25 is not None else supplier_cost
+
+    tier_5 = evaluate_tier("5 Qty", tier_5_cost, sale_price, summary.sold_count, ebay_fee_rate, payment_fee_rate, shipping_cost, packaging_cost, buffer_cost)
+    tier_10 = evaluate_tier("10 Qty", tier_10_cost, sale_price, summary.sold_count, ebay_fee_rate, payment_fee_rate, shipping_cost, packaging_cost, buffer_cost)
+    tier_25 = evaluate_tier("25 Qty", tier_25_cost, sale_price, summary.sold_count, ebay_fee_rate, payment_fee_rate, shipping_cost, packaging_cost, buffer_cost)
 
     selected = select_best_tier([tier_5, tier_10, tier_25])
-    notes = summary.notes
+
+    stock_status = "Unknown"
+    if page_info.in_stock is True:
+        stock_status = "In Stock"
+    elif page_info.in_stock is False:
+        stock_status = "Out of Stock"
+
+    notes_parts = [
+        page_info.notes,
+        f"Supplier cost source: {supplier_cost_source}",
+        summary.notes,
+    ]
     if selected.qualifies:
-        notes = (notes + " | " if notes else "") + f"Selected {selected.tier_name} via smart tiering"
+        notes_parts.append(f"Selected {selected.tier_name} via smart tiering")
     else:
-        notes = (notes + " | " if notes else "") + f"No tier fully qualified; best fallback was {selected.tier_name}"
+        notes_parts.append(f"No tier fully qualified; best fallback was {selected.tier_name}")
+
+    effective_title = page_info.extracted_title or book.title
 
     return ScanResult(
-        title=book.title,
+        title=effective_title,
         isbn13=book.isbn13,
         isbn10=book.isbn10,
+        product_url=book.product_url,
+        supplier_page_fetched=page_info.fetched,
+        supplier_page_title=page_info.page_title,
+        supplier_live_price=page_info.extracted_price,
+        source_price=book.source_price,
         amazon_price=book.amazon_price,
         amazon_rank=book.amazon_rank,
         list_price=book.list_price,
+        stock_status=stock_status,
         ebay_query_used=summary.query_used,
         ebay_sold_count=summary.sold_count,
         ebay_active_count=summary.active_count,
@@ -605,13 +861,14 @@ def scan_book(
         tier_25_profit=tier_25.estimated_profit,
         tier_25_roi=tier_25.roi,
         quick_decision=quick_decision(selected.estimated_profit, selected.roi, summary.sold_count),
-        notes=notes,
+        notes=" | ".join([x for x in notes_parts if x]),
     )
 
 
 def results_to_dataframe(results: List[ScanResult]) -> pd.DataFrame:
     df = pd.DataFrame([asdict(r) for r in results])
     if not df.empty:
+        df["estimated_roi_pct"] = df["estimated_roi"].apply(lambda x: round(x * 100, 2) if pd.notna(x) else None)
         df["decision_sort"] = df["quick_decision"].map({
             "Strong buy": 0,
             "Buy": 1,
@@ -620,7 +877,6 @@ def results_to_dataframe(results: List[ScanResult]) -> pd.DataFrame:
             "No comps": 4,
             "Error": 5,
         }).fillna(9)
-        df["estimated_roi_pct"] = df["estimated_roi"].apply(lambda x: round(x * 100, 2) if pd.notna(x) else None)
         df.sort_values(
             by=["decision_sort", "estimated_profit", "estimated_roi_pct", "ebay_sold_count"],
             ascending=[True, False, False, False],
@@ -721,7 +977,6 @@ def diff_result(previous: Optional[Dict[str, Any]], current: ScanResult, min_pro
             events.append(f"{label} changed: {prev_s} -> {curr_s}.")
 
     important_fields = [
-        ("selected_tier", "Selected tier", False),
         ("estimated_sale_price", "Estimated sale price", False),
         ("selected_unit_cost", "Selected unit cost", False),
         ("estimated_profit", "Estimated profit", False),
@@ -734,8 +989,8 @@ def diff_result(previous: Optional[Dict[str, Any]], current: ScanResult, min_pro
         events.append(f"Decision changed: {previous.get('quick_decision')} -> {current.quick_decision}.")
     if previous.get("ebay_sold_count") != current.ebay_sold_count:
         events.append(f"Sold comp count changed: {previous.get('ebay_sold_count')} -> {current.ebay_sold_count}.")
-    if previous.get("ebay_query_used") != current.ebay_query_used:
-        events.append(f"eBay query changed: {previous.get('ebay_query_used')} -> {current.ebay_query_used}.")
+    if previous.get("stock_status") != current.stock_status:
+        events.append(f"Stock status changed: {previous.get('stock_status')} -> {current.stock_status}.")
 
     significant = []
     for e in events:
@@ -755,6 +1010,7 @@ def build_html_message(items: List[Dict[str, Any]], source_used: str) -> str:
             <tr>
               <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.title}</td>
               <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.isbn13 or result.isbn10}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.stock_status}</td>
               <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.selected_tier}</td>
               <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{format_currency(result.selected_unit_cost)}</td>
               <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{format_currency(result.estimated_sale_price)}</td>
@@ -777,6 +1033,7 @@ def build_html_message(items: List[Dict[str, Any]], source_used: str) -> str:
             <tr>
               <th style="padding:8px;border:1px solid #ddd;text-align:left;">Title</th>
               <th style="padding:8px;border:1px solid #ddd;text-align:left;">ISBN</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Stock</th>
               <th style="padding:8px;border:1px solid #ddd;text-align:left;">Tier</th>
               <th style="padding:8px;border:1px solid #ddd;text-align:left;">Unit Cost</th>
               <th style="padding:8px;border:1px solid #ddd;text-align:left;">Sale Price</th>
@@ -805,6 +1062,7 @@ def build_text_message(items: List[Dict[str, Any]], source_used: str) -> str:
             "",
             f"Title: {result.title}",
             f"ISBN: {result.isbn13 or result.isbn10}",
+            f"Stock: {result.stock_status}",
             f"Tier: {result.selected_tier}",
             f"Unit cost: {format_currency(result.selected_unit_cost)}",
             f"Sale price: {format_currency(result.estimated_sale_price)}",
@@ -842,7 +1100,7 @@ def send_alerts(items: List[Dict[str, Any]], source_used: str) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Track BooksGoat sheet against eBay sold/listed prices.")
+    parser = argparse.ArgumentParser(description="Track BooksGoat supplier books against eBay sold/listed prices.")
     parser.add_argument("--input", type=str, default=str(BACKUP_INPUT_FILE), help="Path to local CSV fallback")
     parser.add_argument("--google-sheet-url", type=str, default="", help="Google Sheets CSV export URL")
     parser.add_argument("--output-csv", type=str, default=str(RESULTS_CSV), help="Output CSV filename")
@@ -893,9 +1151,15 @@ def run_once(args: argparse.Namespace) -> int:
                 title=book.title,
                 isbn13=book.isbn13,
                 isbn10=book.isbn10,
+                product_url=book.product_url,
+                supplier_page_fetched=False,
+                supplier_page_title="",
+                supplier_live_price=None,
+                source_price=book.source_price,
                 amazon_price=book.amazon_price,
                 amazon_rank=book.amazon_rank,
                 list_price=book.list_price,
+                stock_status="Unknown",
                 ebay_query_used=book.isbn13 or book.isbn10 or book.title,
                 ebay_sold_count=0,
                 ebay_active_count=0,
@@ -905,7 +1169,7 @@ def run_once(args: argparse.Namespace) -> int:
                 active_median=None,
                 active_min=None,
                 selected_tier="5 Qty",
-                selected_unit_cost=book.price_5,
+                selected_unit_cost=book.price_5 or book.source_price,
                 estimated_sale_price=None,
                 estimated_fees=None,
                 estimated_total_cost=None,
@@ -963,10 +1227,12 @@ def run_once(args: argparse.Namespace) -> int:
     if not df.empty:
         preview_cols = [
             "title",
-            "selected_tier",
+            "supplier_live_price",
+            "source_price",
+            "ebay_query_used",
+            "ebay_sold_count",
             "estimated_profit",
             "estimated_roi_pct",
-            "ebay_sold_count",
             "quick_decision",
         ]
         print("\nTop opportunities:")
