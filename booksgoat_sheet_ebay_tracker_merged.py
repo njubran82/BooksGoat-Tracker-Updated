@@ -6,13 +6,16 @@ What it does
 - Reads supplier data from a Google Sheets CSV export URL
 - Falls back to a local CSV file if the Google Sheet is unavailable
 - Refreshes the local CSV backup automatically whenever the Google Sheet loads successfully
+- Supports BOTH:
+    1) structured supplier format:
+       Title, ISBN-13, ISBN-10, 5 Qty, 10 Qty, 25 Qty, List Price, Amazon Price, Amazon Rank
+    2) simple backup format:
+       Enabled, ISBN, Label
 - Queries eBay Finding API for sold and active comps using ISBN first, then title fallback
 - Applies smart 5 Qty / 10 Qty / 25 Qty tier selection
 - Calculates estimated sale price, fees, total cost, profit, and ROI
 - Saves current scan results to CSV/XLSX
 - Compares against the previous run and emails alerts when items materially change
-
-Good fit for GitHub Actions because it does NOT scrape BooksGoat product pages.
 """
 
 from __future__ import annotations
@@ -37,6 +40,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import pandas as pd
 import requests
 
+# Temporary hardcoded App ID for testing in GitHub
 os.environ["EBAY_APP_ID"] = "JubranIn-ProfitSc-PRD-4bf497123-06cdelb7"
 
 USER_AGENT = (
@@ -215,22 +219,47 @@ def refresh_backup_csv(csv_text: str, backup_path: Path = BACKUP_INPUT_FILE) -> 
 
 
 def dataframe_to_supplier_books(df: pd.DataFrame) -> List[SupplierBook]:
+    original_columns = list(df.columns)
+    normalized_input = {str(col).strip().lower(): col for col in original_columns}
+
+    # Support your simple CSV format: Enabled, ISBN, Label
+    if "label" in normalized_input and "isbn" in normalized_input:
+        rename_map = {
+            normalized_input["label"]: "Title",
+            normalized_input["isbn"]: "ISBN-13",
+        }
+        if "enabled" in normalized_input:
+            rename_map[normalized_input["enabled"]] = "Enabled"
+        df = df.rename(columns=rename_map)
+
     normalized = {str(col).strip().lower(): col for col in df.columns}
 
-    def col(name: str) -> str:
-        key = name.lower()
-        if key not in normalized:
-            raise KeyError(f"Missing required column: {name}")
-        return normalized[key]
+    def has_col(name: str) -> bool:
+        return name.lower() in normalized
+
+    def get_col(name: str) -> Optional[str]:
+        return normalized.get(name.lower())
+
+    if not has_col("Title"):
+        raise KeyError("Missing required column: Title")
 
     books: List[SupplierBook] = []
     seen: set[str] = set()
+
     for _, row in df.iterrows():
-        title = clean_text(row.get(col("Title"), ""))
+        # If Enabled column exists, honor it
+        if has_col("Enabled"):
+            enabled_val = clean_text(row.get(get_col("Enabled"), "")).lower()
+            if enabled_val and enabled_val not in {"y", "yes", "true", "1"}:
+                continue
+
+        title = clean_text(row.get(get_col("Title"), ""))
         if not title:
             continue
-        isbn13 = clean_isbn(row.get(col("ISBN-13"), ""))
-        isbn10 = clean_isbn(row.get(col("ISBN-10"), ""))
+
+        isbn13 = clean_isbn(row.get(get_col("ISBN-13"), "")) if has_col("ISBN-13") else ""
+        isbn10 = clean_isbn(row.get(get_col("ISBN-10"), "")) if has_col("ISBN-10") else ""
+
         dedupe_key = isbn13 or isbn10 or title.lower()
         if dedupe_key in seen:
             continue
@@ -241,14 +270,15 @@ def dataframe_to_supplier_books(df: pd.DataFrame) -> List[SupplierBook]:
                 title=title,
                 isbn13=isbn13,
                 isbn10=isbn10,
-                price_5=parse_float(row.get(col("5 Qty"))),
-                price_10=parse_float(row.get(col("10 Qty"))),
-                price_25=parse_float(row.get(col("25 Qty"))),
-                list_price=parse_float(row.get(col("List Price"))),
-                amazon_price=parse_float(row.get(col("Amazon Price"))),
-                amazon_rank=parse_int(row.get(col("Amazon Rank"))),
+                price_5=parse_float(row.get(get_col("5 Qty"))) if has_col("5 Qty") else None,
+                price_10=parse_float(row.get(get_col("10 Qty"))) if has_col("10 Qty") else None,
+                price_25=parse_float(row.get(get_col("25 Qty"))) if has_col("25 Qty") else None,
+                list_price=parse_float(row.get(get_col("List Price"))) if has_col("List Price") else None,
+                amazon_price=parse_float(row.get(get_col("Amazon Price"))) if has_col("Amazon Price") else None,
+                amazon_rank=parse_int(row.get(get_col("Amazon Rank"))) if has_col("Amazon Rank") else None,
             )
         )
+
     return books
 
 
@@ -674,7 +704,7 @@ def diff_result(previous: Optional[Dict[str, Any]], current: ScanResult, min_pro
     if previous is None:
         if (current.estimated_profit or 0) >= min_profit_alert and (current.estimated_roi or 0) >= min_roi_alert:
             events.append(
-                f"New opportunity: {current.quick_decision}, profit {format_currency(current.estimated_profit)}, ROI {round((current.estimated_roi or 0)*100, 2)}%."
+                f"New opportunity: {current.quick_decision}, profit {format_currency(current.estimated_profit)}, ROI {round((current.estimated_roi or 0) * 100, 2)}%."
             )
         return events
 
@@ -723,16 +753,16 @@ def build_html_message(items: List[Dict[str, Any]], source_used: str) -> str:
         rows.append(
             f"""
             <tr>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{result.title}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{result.isbn13 or result.isbn10}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{result.selected_tier}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{format_currency(result.selected_unit_cost)}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{format_currency(result.estimated_sale_price)}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{format_currency(result.estimated_profit)}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{roi_pct}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{result.ebay_sold_count}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{result.quick_decision}</td>
-              <td style=\"padding:8px;border:1px solid #ddd;vertical-align:top;\">{event_lines}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.title}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.isbn13 or result.isbn10}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.selected_tier}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{format_currency(result.selected_unit_cost)}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{format_currency(result.estimated_sale_price)}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{format_currency(result.estimated_profit)}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{roi_pct}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.ebay_sold_count}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{result.quick_decision}</td>
+              <td style="padding:8px;border:1px solid #ddd;vertical-align:top;">{event_lines}</td>
             </tr>
             """
         )
@@ -742,19 +772,19 @@ def build_html_message(items: List[Dict[str, Any]], source_used: str) -> str:
         <h2>BooksGoat eBay Tracker Alert</h2>
         <p>Checked at: {local_now_string()}</p>
         <p>Input source used: {source_used}</p>
-        <table style=\"border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;\">
+        <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:14px;">
           <thead>
             <tr>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Title</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">ISBN</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Tier</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Unit Cost</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Sale Price</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Profit</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">ROI</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Sold Count</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Decision</th>
-              <th style=\"padding:8px;border:1px solid #ddd;text-align:left;\">Changes</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Title</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">ISBN</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Tier</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Unit Cost</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Sale Price</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Profit</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">ROI</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Sold Count</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Decision</th>
+              <th style="padding:8px;border:1px solid #ddd;text-align:left;">Changes</th>
             </tr>
           </thead>
           <tbody>
